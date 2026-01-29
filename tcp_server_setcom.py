@@ -525,62 +525,45 @@ def _ramp_runner(com, addr, start_v, end_v, duration_ms, offset_ms=0):
 def run_setcom(tokens):
     """
     Central policy: new commands preempt running ramps & in-flight SetCom processes.
-    - If tokens look like a gradual ramp, spawn ramp thread (start,end,duration[,offset]).
-    - If tokens are an instant-set, preempt and run immediately.
+    - Commands must be either:
+        - instant: 3 tokens -> <com> <addr> <voltage>
+        - ramp:    4 tokens -> <com> <addr> <end_voltage> <duration_ms>
+    - For ramps the start value will be resolved from `last_known_voltage` (-1 marker).
 
-    This version is more aggressive about cancelling running ramps: it sets the cancel
-    event, repeatedly kills any active subprocess while waiting a short time for the
-    ramp thread to exit, then proceeds with the instant command.
+    This version enforces the simpler protocol (single voltage or end+duration) and
+    returns explicit errors for invalid input while keeping aggressive preemption.
     """
     global ramp_thread, ramp_cancel_event, last_known_voltage
 
     tokens = [str(t) for t in tokens]
     logger.info("run_setcom tokens: %s", tokens)
 
-    # parse tokens and detect gradual vs instant
-    is_gradual = False
-    parsed_com = None
-    parsed_addr = None
-    parsed_start = None
-    parsed_end = None
-    parsed_duration = None
-    parsed_offset = 0
+    # Accept only 3 (instant) or 4 (ramp) tokens
+    if len(tokens) not in (3, 4):
+        msg = f"Invalid command format: expected 3 tokens (instant) or 4 tokens (ramp); got {len(tokens)}"
+        logger.warning(msg)
+        return 252, "", msg
 
-    if len(tokens) >= 3:
-        parsed_com = tokens[0]
-        parsed_addr = tokens[1]
-        try:
-            # If tokens length >=4 treat it as ramp-like (start/end)
-            if len(tokens) >= 4:
-                parsed_start = int(tokens[2])
-                parsed_end = int(tokens[3])
-                if len(tokens) > 4:
-                    parsed_duration = int(tokens[4])
-                if len(tokens) > 5:
-                    parsed_offset = int(tokens[5])
-                is_gradual = True
-        except Exception:
-            is_gradual = False
+    # Expect the first two tokens to be 'com3' and '1' (case-insensitive for COM)
+    if tokens[0].lower() != "com3" or tokens[1] != "1":
+        msg = "Invalid command prefix: expected first two tokens 'com3 1'"
+        logger.warning(msg + f" (got: {tokens[0]} {tokens[1]})")
+        return 253, "", msg
 
     # PREEMPT: aggressively cancel running ramp and kill any in-flight SetCom
-    # We do this outside of the ramp runner so the instant command can take over promptly.
     with ramp_lock:
         if ramp_thread and ramp_thread.is_alive():
             logger.info("Preempting existing ramp: signalling cancel")
             ramp_cancel_event.set()
 
-            # Repeatedly attempt to kill currently active subprocess while waiting for ramp thread to exit.
-            # This loop is short but aggressive to make sure the in-flight SetCom stops.
             waited = 0.0
-            wait_total = 1.0    # total time (s) to wait for the ramp thread to exit; tweakable
-            interval = 0.05     # interval between kill attempts
+            wait_total = 1.0
+            interval = 0.05
             while ramp_thread.is_alive() and waited < wait_total:
-                # kill any active child process (forcefully)
                 kill_active_proc(timeout=0.2)
                 time.sleep(interval)
                 waited += interval
 
-            # attempt a join (nonblocking / small timeout) to let the thread finish cleanup
             try:
                 ramp_thread.join(timeout=0.2)
             except Exception:
@@ -591,48 +574,46 @@ def run_setcom(tokens):
             else:
                 logger.info("Ramp thread stopped after preemption (waited %.2fs)", waited)
 
-        # clear any currently-active proc handle so new command can run cleanly
-        # (kill_active_proc above already clears active_proc)
-        # Reset cancel flag for the next command only when we're about to start it.
-        # DO NOT clear here if we are about to start an instant command; we'll clear just before spawning ramp.
-        # For simplicity we'll clear here so the subsequent logic sees a clean state for starting new ops.
         ramp_cancel_event.clear()
-        # ensure no stray child
         kill_active_proc(timeout=0.1)
 
-    # If instant (not gradual), execute now
-    if not is_gradual:
-        instant_tokens = tokens
-        # If the token list includes an explicit numeric voltage as 3rd token, update last_known_voltage
-        if len(instant_tokens) >= 3:
-            try:
-                v = int(instant_tokens[2])
-                with last_known_voltage_lock:
-                    last_known_voltage = v
-            except Exception:
-                pass
-        logger.info("Executing instant command (preempt): %s", instant_tokens)
-        rc, out, err = _start_proc_and_wait(instant_tokens, timeout=SUBPROCESS_TIMEOUT)
+    # Instant command: <com> <addr> <voltage>
+    if len(tokens) == 3:
+        try:
+            v = int(tokens[2])
+        except Exception:
+            msg = f"Invalid voltage value: {tokens[2]}"
+            logger.warning(msg)
+            return 254, "", msg
+        # update last known voltage and execute immediately
+        with last_known_voltage_lock:
+            last_known_voltage = v
+        logger.info("Executing instant command (preempt): %s %s %s", tokens[0], tokens[1], v)
+        rc, out, err = _start_proc_and_wait(tokens, timeout=SUBPROCESS_TIMEOUT)
         logger.info("Instant completed rc=%s", rc)
         return rc, out or "", err or ""
 
-    # else: start ramp thread (use last_known_voltage if start == -1)
+    # Ramp command: <com> <addr> <end_voltage> <duration_ms>
     try:
-        com_num = int(parsed_com) if str(parsed_com).lstrip("+-").isdigit() else parsed_com
+        end_v = int(tokens[2])
+        duration_ms = int(tokens[3])
     except Exception:
-        com_num = parsed_com
-    addr_str = parsed_addr
-    start_v = parsed_start if parsed_start is not None else -1
-    end_v = parsed_end if parsed_end is not None else start_v
-    duration_ms = parsed_duration if parsed_duration is not None else 30000
-    offset_ms = parsed_offset
+        msg = "Invalid ramp arguments: end_voltage and duration_ms must be integers"
+        logger.warning(msg)
+        return 254, "", msg
+
+    try:
+        com_num = int(tokens[0]) if str(tokens[0]).lstrip("+-").isdigit() else tokens[0]
+    except Exception:
+        com_num = tokens[0]
+    addr_str = tokens[1]
+    start_v = -1  # use last_known_voltage in runner
+    offset_ms = 0
 
     logger.info("Starting ramp thread com=%s addr=%s start=%s end=%s dur=%sms offset=%sms", com_num, addr_str, start_v, end_v, duration_ms, offset_ms)
-    # clear any lingering cancel flag and start ramp thread
     ramp_cancel_event.clear()
     ramp_thread = threading.Thread(target=_ramp_runner, args=(com_num, addr_str, start_v, end_v, duration_ms, offset_ms), daemon=True)
     ramp_thread.start()
-    # immediate ack for caller
     return 0, f"ramp started {start_v}->{end_v} dur={duration_ms} offset={offset_ms}", ""
 
 # ---------- TCP handler for Zoom Room messages ----------
